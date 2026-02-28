@@ -169,7 +169,7 @@ class FingerprintFetcher:
                 "DEVICE_INITIAL_SDK_INT": "32",
                 # Extract additional fields from fingerprint
                 "BRAND": "google",
-                "RELEASE": fingerprint.split(':')[1] if ':' in fingerprint else "",
+                "RELEASE": fingerprint.split(':')[1].split('/')[0] if ':' in fingerprint else "",
                 "ID": fingerprint.split('/')[3] if fingerprint.count('/') >= 4 else "",
                 "INCREMENTAL": fingerprint.split('/')[4].split(':')[0] if fingerprint.count('/') >= 4 else "",
                 "TYPE": "user",
