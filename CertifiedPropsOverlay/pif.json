@@ -1,15 +1,15 @@
 {
   "MANUFACTURER": "Google",
-  "MODEL": "Pixel 10 Pro Fold",
-  "FINGERPRINT": "google/rango_beta/rango:CinnamonBun/CP21.260206.011/14911669:user/release-keys",
-  "PRODUCT": "rango_beta",
-  "DEVICE": "rango",
-  "SECURITY_PATCH": "2026-02-05",
+  "MODEL": "Pixel Fold",
+  "FINGERPRINT": "google/tangorpro_beta/tangorpro:16/CP11.251209.009.A1/14840729:user/release-keys",
+  "PRODUCT": "tangorpro_beta",
+  "DEVICE": "tangorpro",
+  "SECURITY_PATCH": "2026-01-05",
   "DEVICE_INITIAL_SDK_INT": "32",
   "BRAND": "google",
-  "RELEASE": "CinnamonBun",
-  "ID": "CP21.260206.011",
-  "INCREMENTAL": "14911669",
+  "RELEASE": "16",
+  "ID": "CP11.251209.009.A1",
+  "INCREMENTAL": "14840729",
   "TYPE": "user",
   "TAGS": "release-keys"
 }
