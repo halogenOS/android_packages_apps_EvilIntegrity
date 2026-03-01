@@ -29,7 +29,8 @@ class FingerprintFetcher:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
 
-    def fetch_from_google(self, force_preview: bool = False, depth: int = 1) -> Optional[Dict[str, str]]:
+    def fetch_from_google(self, force_preview: bool = False, depth: int = 1,
+                          version: Optional[int] = None) -> Optional[Dict[str, str]]:
         """
         Fetch latest Pixel Beta fingerprint from Google Developer pages
         Mimics osm0sis' autopif2.sh logic
@@ -48,6 +49,15 @@ class FingerprintFetcher:
             if not beta_urls:
                 print("No beta version URLs found")
                 return None
+
+            # Filter by version if specified
+            if version is not None:
+                beta_urls = [u for u in beta_urls if u.rstrip('/').endswith(f'/{version}')
+                             or u.rstrip('/').endswith(f'-{version}')]
+                if not beta_urls:
+                    print(f"No beta URLs found for Android {version}")
+                    return None
+                print(f"Filtered to Android {version}")
 
             # Get the latest or second latest based on preview status
             latest_url = f"https://developer.android.com{beta_urls[0]}"
@@ -68,29 +78,60 @@ class FingerprintFetcher:
             resp = self.session.get(beta_url, timeout=10)
             resp.raise_for_status()
 
-            # Find OTA download page
+            # Find OTA download pages
             ota_links = re.findall(r'href="([^"]*download-ota[^"]*)"', resp.text)
-            if not ota_links or len(ota_links) < depth:
-                print("Not enough OTA download links found")
+            if not ota_links:
+                print("No OTA download links found")
                 return None
 
-            ota_url = f"https://developer.android.com{ota_links[depth-1]}"
-            print(f"Fetching OTA page (depth={depth}): {ota_url}")
+            if depth > 0:
+                # Specific depth requested
+                if len(ota_links) < depth:
+                    print("Not enough OTA download links found")
+                    return None
+                pages_to_try = [(depth, ota_links[depth-1])]
+            else:
+                # Try all pages, pick newest security patch
+                pages_to_try = [(i+1, link) for i, link in enumerate(ota_links)]
 
-            resp = self.session.get(ota_url, timeout=10)
-            resp.raise_for_status()
+            best_result = None
+            best_patch = ""
 
-            # Extract Android version info
-            version_match = re.search(r'tooltip>Android\s+([^<]+)', resp.text)
-            qpr_match = re.search(r'tooltip>QPR.*?\s+Beta', resp.text)
+            for page_depth, link in pages_to_try:
+                ota_url = f"https://developer.android.com{link}"
+                print(f"Fetching OTA page (depth={page_depth}): {ota_url}")
 
-            if version_match:
-                version_str = f"Android {version_match.group(1)}"
-                if qpr_match:
-                    version_str += f" {qpr_match.group(0).split('>')[-1]}"
-                print(version_str)
+                page_resp = self.session.get(ota_url, timeout=10)
+                page_resp.raise_for_status()
 
-            return self._parse_ota_page(resp.text)
+                # Extract Android version info
+                version_match = re.search(r'tooltip>Android\s+([^<]+)', page_resp.text)
+                qpr_match = re.search(r'tooltip>QPR.*?\s+Beta', page_resp.text)
+
+                if version_match:
+                    version_str = f"Android {version_match.group(1)}"
+                    if qpr_match:
+                        version_str += f" {qpr_match.group(0).split('>')[-1]}"
+                    print(version_str)
+
+                result = self._parse_ota_page(page_resp.text)
+                if result:
+                    patch = result.get('SECURITY_PATCH', '')
+                    if depth > 0:
+                        return result
+                    if patch > best_patch:
+                        best_patch = patch
+                        best_result = result
+                        print(f"  -> security patch: {patch} (best so far)")
+                        # Stop early if patch is from current month
+                        current_month = datetime.now().strftime('%Y-%m')
+                        if patch.startswith(current_month):
+                            print(f"  -> current month patch found, stopping search")
+                            return best_result
+                    else:
+                        print(f"  -> security patch: {patch} (skipping, older)")
+
+            return best_result
 
         except Exception as e:
             print(f"Error fetching from Google: {e}")
@@ -244,26 +285,53 @@ class FingerprintFetcher:
 
         return result
 
-    def fetch_fingerprint(self, force_preview: bool = False, depth: int = 1) -> Optional[Dict[str, str]]:
+    def fetch_fingerprint(self, force_preview: bool = False, depth: int = 1,
+                          version: Optional[int] = None) -> Optional[Dict[str, str]]:
         """Main method to fetch fingerprint from any available source"""
         print("Pixel Beta pif.json generator")
         print("  based on osm0sis @ xda-developers")
+        if version is not None:
+            print(f"  filtering for Android {version}")
         print("")
 
         # Try Google first
-        fingerprint = self.fetch_from_google(force_preview=force_preview, depth=depth)
+        fingerprint = self.fetch_from_google(force_preview=force_preview, depth=depth,
+                                             version=version)
         if fingerprint:
-            print("Successfully fetched from Google")
-            return fingerprint
+            if version is not None and not self._matches_version(fingerprint, version):
+                print(f"Warning: fetched fingerprint is not Android {version}, skipping")
+            else:
+                print("Successfully fetched from Google")
+                return fingerprint
 
         # Try fallback sources
         fingerprint = self.fetch_from_fallback()
         if fingerprint:
-            print("Successfully fetched from fallback source")
-            return fingerprint
+            if version is not None and not self._matches_version(fingerprint, version):
+                print(f"Warning: fallback fingerprint is not Android {version}, skipping")
+            else:
+                print("Successfully fetched from fallback source")
+                return fingerprint
 
         print("Failed to fetch fingerprint from any source")
         return None
+
+    def _matches_version(self, fingerprint: Dict[str, str], version: int) -> bool:
+        """Check if a fingerprint matches the requested Android version"""
+        release = fingerprint.get('RELEASE', '')
+        try:
+            return int(release) == version
+        except ValueError:
+            # Non-numeric release (e.g. CinnamonBun) — check the fingerprint string
+            fp = fingerprint.get('FINGERPRINT', '')
+            # Fingerprint format: brand/product/device:RELEASE/ID/...
+            if ':' in fp:
+                fp_release = fp.split(':')[1].split('/')[0]
+                try:
+                    return int(fp_release) == version
+                except ValueError:
+                    return False
+            return False
 
 
 class OverlayGenerator:
@@ -441,9 +509,14 @@ def main():
     parser.add_argument(
         '-d', '--depth',
         type=int,
-        default=1,
-        choices=range(1, 10),
-        help='OTA page depth to use (default: 1)'
+        default=0,
+        choices=range(0, 10),
+        help='OTA page depth to use (0=auto-select newest patch, default: 0)'
+    )
+    parser.add_argument(
+        '-v', '--version',
+        type=int,
+        help='Android version to filter for (e.g. 16)'
     )
 
     args = parser.parse_args()
@@ -452,7 +525,8 @@ def main():
     fetcher = FingerprintFetcher()
     fingerprint = fetcher.fetch_fingerprint(
         force_preview=args.preview,
-        depth=args.depth
+        depth=args.depth,
+        version=args.version
     )
 
     if not fingerprint:
