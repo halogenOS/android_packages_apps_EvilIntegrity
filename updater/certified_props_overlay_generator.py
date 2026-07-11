@@ -116,6 +116,12 @@ class FingerprintFetcher:
 
                 result = self._parse_ota_page(page_resp.text)
                 if result:
+                    if version is not None and not self._build_id_matches_version(
+                            self._build_id(result), version):
+                        print(f"  -> build {self._build_id(result) or '?'} is not "
+                              f"Android {version} (want {self._expected_build_letter(version)}* "
+                              f"build ID), skipping")
+                        continue
                     patch = result.get('SECURITY_PATCH', '')
                     if depth > 0:
                         return result
@@ -139,25 +145,34 @@ class FingerprintFetcher:
 
     def _parse_ota_page(self, html: str) -> Optional[Dict[str, str]]:
         """Parse OTA page to extract device fingerprint info"""
-        # Extract device models
-        model_matches = re.findall(r'<tr id=[^>]+>.*?<td>([^<]+)</td>', html, re.DOTALL)
+        # Pair each device's MODEL, PRODUCT and OTA URL through the shared
+        # codename so they can never cross-associate. On the OTA pages every
+        # device is a `<tr id="CODENAME">` whose first <td> is the marketing
+        # MODEL; the download URL lives in a separate modal dialog but its
+        # filename is prefixed with the same codename (ota/CODENAME_beta-ota-...).
+        # Pairing MODEL to the URL by codename avoids the misalignment that
+        # independent page-wide regexes hit when their lists differ in
+        # length/order — which would ship an inconsistent fingerprint (e.g. a
+        # marketing name on the wrong codename) and fail Play Integrity.
+        ota_by_codename = {}
+        for url, codename in re.findall(
+                r'href="([^"]*ota/([^/"]+)_beta-ota-[^"]*)"', html):
+            ota_by_codename.setdefault(codename, url)
 
-        # Extract product names (device_beta format)
-        product_matches = re.findall(r'ota/([^/]+_beta)', html)
+        devices = []
+        for codename, body in re.findall(r'<tr id="([^"]+)">(.*?)</tr>', html,
+                                         re.DOTALL):
+            model_match = re.search(r'<td>([^<]+)</td>', body)
+            if codename in ota_by_codename and model_match:
+                devices.append((model_match.group(1).strip(),
+                                f"{codename}_beta", ota_by_codename[codename]))
 
-        # Extract OTA URLs
-        ota_urls = re.findall(r'href="([^"]*ota/[^"]+_beta[^"]*)"', html)
-
-        if not model_matches or not product_matches or not ota_urls:
+        if not devices:
             print("Failed to extract device information from OTA page")
             return None
 
         # Select random device
-        idx = random.randint(0, min(len(model_matches), len(product_matches), len(ota_urls)) - 1)
-
-        model = model_matches[idx]
-        product = product_matches[idx]
-        ota_url = ota_urls[idx]
+        model, product, ota_url = devices[random.randint(0, len(devices) - 1)]
         device = product.replace('_beta', '')
 
         print(f"Selected: {model} ({product})")
@@ -317,7 +332,20 @@ class FingerprintFetcher:
         return None
 
     def _matches_version(self, fingerprint: Dict[str, str], version: int) -> bool:
-        """Check if a fingerprint matches the requested Android version"""
+        """Check that a fingerprint is a genuine build for the requested version.
+
+        A real Google build is internally consistent: the numeric platform
+        release AND the build-ID prefix letter encode the same Android version.
+        During a beta transition the scraper can land on a *next* version build
+        (e.g. an Android 17 "CP..." / Cinnamon Bun build) whose OTA fingerprint
+        still carries a stale release token of 16 — that combination never ships
+        from Google and fails Play Integrity. Require BOTH signals to agree.
+        """
+        return (self._release_matches(fingerprint, version)
+                and self._build_id_matches_version(self._build_id(fingerprint), version))
+
+    def _release_matches(self, fingerprint: Dict[str, str], version: int) -> bool:
+        """Check the numeric VERSION.RELEASE token against the requested version."""
         release = fingerprint.get('RELEASE', '')
         try:
             return int(release) == version
@@ -332,6 +360,31 @@ class FingerprintFetcher:
                 except ValueError:
                     return False
             return False
+
+    @staticmethod
+    def _build_id(fingerprint: Dict[str, str]) -> str:
+        """Return the platform build ID (e.g. 'BP4A.251205.006') for a fingerprint."""
+        build_id = fingerprint.get('ID', '')
+        if build_id:
+            return build_id
+        # Fingerprint format: brand/product/device:RELEASE/ID/INCREMENTAL:...
+        parts = fingerprint.get('FINGERPRINT', '').split('/')
+        return parts[3] if len(parts) >= 4 else ''
+
+    @staticmethod
+    def _expected_build_letter(version: int) -> str:
+        """First letter of the build ID for a given Android platform version.
+
+        Post-wrap AOSP scheme (letters restart at 'A' after Android 14 'U'):
+        A=15 (VanillaIceCream), B=16 (Baklava), C=17 (Cinnamon Bun), ... so the
+        letter is 'A' + (version - 15). Only needs to be correct for the versions
+        this tool targets (>= 15).
+        """
+        return chr(ord('A') + version - 15)
+
+    def _build_id_matches_version(self, build_id: str, version: int) -> bool:
+        """True if the build ID's prefix letter matches the requested version."""
+        return bool(build_id) and build_id[:1].upper() == self._expected_build_letter(version)
 
 
 class OverlayGenerator:
