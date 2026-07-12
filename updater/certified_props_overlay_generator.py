@@ -418,7 +418,7 @@ class OverlayGenerator:
         """Generate fingerprint overlay XML"""
         # Create XML structure
         resources = ET.Element('resources')
-        array = ET.SubElement(resources, 'array', name='config_certifiedBuildProperties')
+        array = ET.SubElement(resources, 'array', name='control_conformance_attributes')
 
         # Map fingerprint data to property format
         property_map = [
@@ -483,10 +483,10 @@ runtime_resource_overlay {
         manifest_content = '''<?xml version="1.0" encoding="utf-8"?>
 <manifest
     xmlns:android="http://schemas.android.com/apk/res/android"
-    package="custom.overlay.certifiedprops">
+    package="custom.overlay.corporatecontrolsatisfier">
     <application android:hasCode="false" />
     <overlay
-        android:targetPackage="android"
+        android:targetPackage="custom.corporatecontrolsatisfier"
         android:isStatic="true" />
 </manifest>
 '''

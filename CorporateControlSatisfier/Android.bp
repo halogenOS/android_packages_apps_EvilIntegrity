@@ -1,0 +1,17 @@
+//
+// Copyright (C) 2026 The halogenOS Project
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+android_app {
+    name: "CorporateControlSatisfier",
+    certificate: "platform",
+    sdk_version: "system_current",
+    privileged: true,
+    product_specific: true,
+
+    srcs: [
+        "src/**/*.java",
+    ],
+}

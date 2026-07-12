@@ -53,39 +53,6 @@
           };
         };
 
-        keybox-overlay-generator = pkgs.stdenv.mkDerivation rec {
-          pname = "keybox-overlay-generator";
-          version = "1.0.0";
-
-          src = ./.;
-
-          buildInputs = [ pythonPackages.python ];
-          nativeBuildInputs = [ pkgs.makeWrapper ];
-
-          installPhase = ''
-            mkdir -p $out/bin
-            cp keybox_overlay_generator.py $out/bin/keybox-overlay-generator
-            chmod +x $out/bin/keybox-overlay-generator
-
-            # Wrap the script
-            wrapProgram $out/bin/keybox-overlay-generator \
-              --prefix PYTHONPATH : ${pythonPackages.makePythonPath []} \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils ]}
-          '';
-
-          meta = with pkgs.lib; {
-            description = "Converts keybox.xml files into Android overlay format";
-            longDescription = ''
-              Processes Android TEE keybox files for hardware attestation.
-
-              WARNING: Keybox files contain private keys and should never
-              be shared publicly as they will be revoked by Google.
-            '';
-            homepage = "https://github.com/your-org/android-overlay-generators";
-            platforms = platforms.all;
-          };
-        };
-
         devShell = pkgs.mkShell {
           buildInputs = with pkgs; [
             python311
@@ -105,7 +72,6 @@
             echo ""
             echo "Available scripts:"
             echo "  certified_props_overlay_generator.py - Generate fingerprint overlay"
-            echo "  keybox_overlay_generator.py         - Convert keybox.xml to overlay"
             echo ""
             echo "Examples:"
             echo "  # Generate fingerprint overlay"
@@ -113,12 +79,6 @@
             echo ""
             echo "  # Use Developer Preview"
             echo "  python certified_props_overlay_generator.py --preview"
-            echo ""
-            echo "  # Convert keybox.xml"
-            echo "  python keybox_overlay_generator.py keybox.xml"
-            echo ""
-            echo "  # Show keybox format"
-            echo "  python keybox_overlay_generator.py --format"
             echo ""
             echo "Development tools:"
             echo "  black *.py       - Format code"
@@ -133,7 +93,6 @@
         packages = {
           default = certified-props-overlay-generator;
           certified-props = certified-props-overlay-generator;
-          keybox = keybox-overlay-generator;
         };
 
         apps = {
@@ -144,10 +103,6 @@
           certified-props = {
             type = "app";
             program = "${certified-props-overlay-generator}/bin/certified-props-overlay-generator";
-          };
-          keybox = {
-            type = "app";
-            program = "${keybox-overlay-generator}/bin/keybox-overlay-generator";
           };
         };
 
