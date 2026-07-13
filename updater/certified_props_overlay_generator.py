@@ -27,6 +27,10 @@ class FingerprintFetcher:
     # rows the page shows after you click "Acknowledge".
     STABLE_OTA_URL = "https://developers.google.com/android/ota"
     STABLE_OTA_COOKIE = "devsite_wall_acks=nexus-ota-tos"
+    # Factory image list (raw partition images, incl. the signed vbmeta from
+    # which the real verified-boot values are read). Behind its own ToS wall.
+    STABLE_IMAGES_URL = "https://developers.google.com/android/images"
+    STABLE_IMAGES_COOKIE = "devsite_wall_acks=nexus-image-tos"
 
     # Launch API level (ro.product.first_api_level / DEVICE_INITIAL_SDK_INT) by
     # Pixel codename = the SDK the device SHIPPED with. The integrity probe
@@ -231,10 +235,63 @@ class FingerprintFetcher:
                 url, model, extra_headers={'Cookie': self.STABLE_OTA_COOKIE})
             if not result:
                 print("  Failed to read fingerprint from OTA metadata")
+                return result
+
+            # Pull the real verified-boot values from the matching factory
+            # image so the spoofed "locked/green" state is backed by coherent
+            # vbmeta/dm-verity data. Best-effort: a failure here must not break
+            # the fingerprint refresh, only omit the vbmeta props.
+            self._attach_vbmeta_values(result, codename, newest)
             return result
         except Exception as e:
             print(f"Error fetching stable OTA: {e}")
             return None
+
+    def _find_factory_url(self, codename: str, build_id: str) -> Optional[str]:
+        """Locate the factory-image zip for an exact codename+build on the
+        images page. Returns None if not published (older/newer than OTA)."""
+        resp = self.session.get(self.STABLE_IMAGES_URL, timeout=30,
+                                headers={'Cookie': self.STABLE_IMAGES_COOKIE})
+        resp.raise_for_status()
+        pattern = (r'https://dl\.google\.com/dl/android/aosp/'
+                   + re.escape(codename) + '-' + re.escape(build_id.lower())
+                   + r'-factory-[0-9a-f]+\.zip')
+        m = re.search(pattern, resp.text)
+        return m.group(0) if m else None
+
+    def _attach_vbmeta_values(self, result: Dict[str, str], codename: str,
+                              build_id: str) -> None:
+        """Read the factory image's real vbmeta/dm-verity values and stash them
+        on ``result`` under private keys the OverlayGenerator turns into raw
+        SYSPROP.* / ATTEST.* overlay items."""
+        try:
+            import shutil
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import vbmeta_extract
+
+            factory_url = self._find_factory_url(codename, build_id)
+            if not factory_url:
+                print(f"  No factory image for {codename} {build_id}; "
+                      "skipping vbmeta values")
+                return
+            print(f"  Reading verified-boot values from {factory_url}")
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))))
+            work_dir = os.path.join(repo_root, ".cache", "vbmeta-getter")
+            try:
+                values = vbmeta_extract.extract_vbmeta_values(
+                    factory_url, self.STABLE_IMAGES_COOKIE, work_dir)
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+            result['_RAW_SYSPROPS'] = values['sysprops']
+            result['_ATTEST'] = {'VBOOT_KEY': values['verified_boot_key']}
+            print(f"  vbmeta.digest={values['sysprops']['ro.boot.vbmeta.digest']} "
+                  f"({len(values['sysprops'])} raw props, "
+                  f"verifiedBootKey={values['verified_boot_key'][:16]}...)")
+        except Exception as e:
+            print(f"  WARN: could not read vbmeta values ({e}); "
+                  "overlay will omit them")
 
     def _fingerprint_from_ota(self, ota_url: str, model: str,
                               extra_headers: Optional[Dict[str, str]] = None
@@ -597,15 +654,37 @@ class OverlayGenerator:
                     item = ET.SubElement(array, 'item')
                     item.text = f"{prop_key}:{value}"
 
+        # Raw system properties (real verified-boot values from the factory
+        # image). These are applied verbatim by SimplePropImitation via the
+        # SYSPROP. prefix, not mapped onto Build.* fields.
+        for name, value in sorted(
+                self.fingerprint_data.get('_RAW_SYSPROPS', {}).items()):
+            if value:
+                item = ET.SubElement(array, 'item')
+                item.text = f"SYSPROP.{name}:{value}"
+
+        # Attestation-only values with no real sysprop counterpart (the
+        # verified-boot key hash). Stashed by SimplePropImitation for
+        # KeyboxImitationHooks under the ATTEST. prefix; never set as a prop.
+        for name, value in sorted(
+                self.fingerprint_data.get('_ATTEST', {}).items()):
+            if value:
+                item = ET.SubElement(array, 'item')
+                item.text = f"ATTEST.{name}:{value}"
+
         # Write XML file
         self._write_xml(resources, output_path)
         print(f"Generated: {output_path}")
 
     def _generate_pif_json(self, output_path: str):
         """Generate pif.json for Play Integrity Fix module"""
-        # Write JSON file with proper formatting
+        # Emit only the Build-field fingerprint; private keys (prefixed with
+        # '_', e.g. the raw vbmeta props) are framework-overlay concerns and
+        # would confuse a stock PIF module that keys on Build.* fields.
+        pif_data = {k: v for k, v in self.fingerprint_data.items()
+                    if not k.startswith('_')}
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(self.fingerprint_data, f, indent=2)
+            json.dump(pif_data, f, indent=2)
             f.write('\n')  # Add final newline
 
         print(f"Generated: {output_path}")
