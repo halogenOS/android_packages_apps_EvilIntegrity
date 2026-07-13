@@ -22,6 +22,26 @@ class FingerprintFetcher:
 
     # Google's developer pages for Android versions
     ANDROID_VERSIONS_URL = "https://developer.android.com/about/versions"
+    # Stable full-OTA image list. The download table is behind a devsite ToS
+    # wall; replaying the acknowledgement cookie reveals the same server-rendered
+    # rows the page shows after you click "Acknowledge".
+    STABLE_OTA_URL = "https://developers.google.com/android/ota"
+    STABLE_OTA_COOKIE = "devsite_wall_acks=nexus-ota-tos"
+
+    # Launch API level (ro.product.first_api_level / DEVICE_INITIAL_SDK_INT) by
+    # Pixel codename = the SDK the device SHIPPED with. The integrity probe
+    # cross-checks it against the claimed model, so a wrong value is an
+    # inconsistency no stock device has. It is NOT in the OTA metadata, so
+    # it is a maintained per-device constant.
+    LAUNCH_API_LEVEL = {
+        "oriole": 31, "raven": 31, "bluejay": 31,             # Pixel 6 / 6 Pro / 6a   (A12)
+        "panther": 33, "cheetah": 33, "lynx": 33,             # Pixel 7 / 7 Pro / 7a   (A13)
+        "tangorpro": 33, "felix": 33,                         # Pixel Tablet / Fold    (A13)
+        "shiba": 34, "husky": 34, "akita": 34,                # Pixel 8 / 8 Pro / 8a   (A14)
+        "tokay": 34, "caiman": 34, "komodo": 34, "comet": 34, # Pixel 9 / Pro / XL / Fold (A14)
+        "tegu": 35,                                           # Pixel 9a               (A15)
+    }
+    DEFAULT_LAUNCH_API_LEVEL = 34
 
     def __init__(self):
         self.session = requests.Session()
@@ -141,6 +161,129 @@ class FingerprintFetcher:
 
         except Exception as e:
             print(f"Error fetching from Google: {e}")
+            return None
+
+    def fetch_from_google_stable(self, version: Optional[int] = None,
+                                 min_devices: int = 2) -> Optional[Dict[str, str]]:
+        """Fetch the newest *stable* release fingerprint from Google's full-OTA
+        image list.
+
+        Unlike the Beta crawl, these are the exact builds shipping to retail
+        Pixels, so the fingerprint cannot be burned without breaking real
+        devices. Selection: the newest build (by build-ID date) whose HTML row
+        is labelled with the requested Android version AND that ships on at
+        least ``min_devices`` models — the device-count floor skips one-off
+        device-specific trains (e.g. a tablet's private CP1A/BD6A build that is
+        still labelled "16.0.0") and lands on the mainstream flagship release.
+        The version comes from the row's authoritative "16.0.0 (...)" label,
+        never from the build-ID prefix letter, which is not a reliable signal.
+        """
+        try:
+            print("Fetching stable full-OTA list from Google...")
+            resp = self.session.get(
+                self.STABLE_OTA_URL, timeout=15,
+                headers={'Cookie': self.STABLE_OTA_COOKIE})
+            resp.raise_for_status()
+            html = resp.text
+
+            # codename -> marketing model, from the per-device <h2> headings.
+            models = dict(re.findall(
+                r'<h2 id="([^"]+)"[^>]*data-text=\'"[^"]*" for ([^\']+)\'', html))
+
+            # Each OTA is a table row:
+            #   <td>16.0.0 (BP4A.251205.006, Dec 2025)</td>
+            #   <td><a href="...codename-ota-buildid-hash.zip">Link</a></td>
+            builds = {}   # build_id -> list of (codename, url, model)
+            for block in re.findall(r'<tr id="[^"]*">(.*?)</tr>', html, re.DOTALL):
+                vm = re.search(r'<td>([\d.]+)\s*\(([^,]+),', block)
+                um = re.search(r'href="(https://dl\.google\.com/[^"]+\.zip)"', block)
+                if not vm or not um:
+                    continue
+                version_label, build_id = vm.group(1), vm.group(2).strip()
+                if version is not None and version_label.split('.')[0] != str(version):
+                    continue
+                url = um.group(1)
+                codename = url.rsplit('/', 1)[-1].split('-ota-')[0]
+                builds.setdefault(build_id, []).append(
+                    (codename, url, models.get(codename, codename)))
+
+            eligible = {b: d for b, d in builds.items() if len(d) >= min_devices}
+            if not eligible:
+                print(f"  No stable Android {version} build shipping on "
+                      f">= {min_devices} devices found")
+                return None
+
+            def newness(build_id: str):
+                # e.g. BP4A.260205.002[.a1]: sort by (date, build number), and
+                # prefer the base build over a ".<letter><digit>" carrier variant.
+                m = re.search(r'\.(\d{6})\.(\d+)', build_id)
+                if not m:
+                    return ('', 0, 0)
+                is_base = 0 if re.search(r'\.\d+\.[a-z]', build_id, re.I) else 1
+                return (m.group(1), int(m.group(2)), is_base)
+
+            newest = max(eligible, key=newness)
+            codename, url, model = sorted(eligible[newest])[0]
+            print(f"  Newest stable Android {version}: {newest} "
+                  f"({len(eligible[newest])} devices) -> {model} ({codename})")
+
+            result = self._fingerprint_from_ota(
+                url, model, extra_headers={'Cookie': self.STABLE_OTA_COOKIE})
+            if not result:
+                print("  Failed to read fingerprint from OTA metadata")
+            return result
+        except Exception as e:
+            print(f"Error fetching stable OTA: {e}")
+            return None
+
+    def _fingerprint_from_ota(self, ota_url: str, model: str,
+                              extra_headers: Optional[Dict[str, str]] = None
+                              ) -> Optional[Dict[str, str]]:
+        """Read an OTA zip's metadata head and assemble a fingerprint dict.
+
+        Only the first 2 MB is read (the OTA metadata block lives near the
+        start), then post-build (the full build fingerprint) and the
+        security-patch-level are extracted, exactly like autopif2.sh.
+        """
+        try:
+            resp = self.session.get(ota_url, stream=True, timeout=15,
+                                    headers=extra_headers or {})
+            resp.raise_for_status()
+            metadata = b''
+            for chunk in resp.iter_content(chunk_size=8192):
+                metadata += chunk
+                if len(metadata) >= 2 * 1024 * 1024:
+                    break
+            text = metadata.decode('utf-8', errors='ignore')
+            fp_match = re.search(r'post-build=([^\x00\n]+)', text)
+            sp_match = re.search(r'(?:post-)?security-patch-level=([^\x00\n]+)', text)
+            if not fp_match or not sp_match:
+                print("  post-build / security-patch-level not found in OTA metadata")
+                return None
+            fingerprint = fp_match.group(1).strip()
+            parts = fingerprint.split('/')
+            device = parts[2].split(':')[0] if len(parts) > 2 else ""
+            initial_sdk = self.LAUNCH_API_LEVEL.get(device, self.DEFAULT_LAUNCH_API_LEVEL)
+            if device not in self.LAUNCH_API_LEVEL:
+                print(f"  WARN: no launch API level known for '{device}', "
+                      f"defaulting DEVICE_INITIAL_SDK_INT to {initial_sdk}")
+            return {
+                "MANUFACTURER": "Google",
+                "MODEL": model,
+                "FINGERPRINT": fingerprint,
+                "PRODUCT": parts[1] if len(parts) > 1 else "",
+                "DEVICE": device,
+                "SECURITY_PATCH": sp_match.group(1).strip(),
+                "DEVICE_INITIAL_SDK_INT": str(initial_sdk),
+                "BRAND": "google",
+                "RELEASE": fingerprint.split(':')[1].split('/')[0] if ':' in fingerprint else "",
+                "ID": parts[3] if len(parts) >= 4 else "",
+                "INCREMENTAL": parts[4].split(':')[0] if len(parts) >= 5 else "",
+                "TYPE": "user",
+                "TAGS": "release-keys",
+            }
+        except Exception as e:
+            print(f"  Error reading OTA metadata: {e}")
             return None
 
     def _parse_ota_page(self, html: str) -> Optional[Dict[str, str]]:
@@ -301,13 +444,23 @@ class FingerprintFetcher:
         return result
 
     def fetch_fingerprint(self, force_preview: bool = False, depth: int = 1,
-                          version: Optional[int] = None) -> Optional[Dict[str, str]]:
+                          version: Optional[int] = None,
+                          stable: bool = False) -> Optional[Dict[str, str]]:
         """Main method to fetch fingerprint from any available source"""
-        print("Pixel Beta pif.json generator")
+        print("Pixel pif.json generator")
         print("  based on osm0sis @ xda-developers")
         if version is not None:
             print(f"  filtering for Android {version}")
         print("")
+
+        # A stable retail fingerprint is preferred when requested: it is a build
+        # shipping to real devices, so it cannot be burned without collateral.
+        if stable:
+            fingerprint = self.fetch_from_google_stable(version=version)
+            if fingerprint:
+                print("Successfully fetched stable fingerprint")
+                return fingerprint
+            print("Stable fetch failed; falling back to Beta crawl")
 
         # Try Google first
         fingerprint = self.fetch_from_google(force_preview=force_preview, depth=depth,
@@ -571,6 +724,13 @@ def main():
         type=int,
         help='Android version to filter for (e.g. 16)'
     )
+    parser.add_argument(
+        '-s', '--stable',
+        action='store_true',
+        help='Fetch a stable retail release fingerprint from Google\'s full-OTA '
+             'image list instead of a Beta (recommended: real-device builds '
+             'cannot be burned without collateral)'
+    )
 
     args = parser.parse_args()
 
@@ -579,7 +739,8 @@ def main():
     fingerprint = fetcher.fetch_fingerprint(
         force_preview=args.preview,
         depth=args.depth,
-        version=args.version
+        version=args.version,
+        stable=args.stable
     )
 
     if not fingerprint:
