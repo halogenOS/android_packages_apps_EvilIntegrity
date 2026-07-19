@@ -44,6 +44,26 @@ _CHECK_AT_MOST_ONCE = "0"
 # Standard locked-Pixel kernel cmdline: androidboot.vbmeta.invalidate_on_error.
 _INVALIDATE_ON_ERROR = "yes"
 
+# SoC / hardware props read from the factory image's vendor/build.prop. The
+# probe collects these; leaving the device's real values in place while claiming
+# different silicon is an obvious inconsistency. Extracted verbatim from the
+# claimed device's image so they stay coherent with the fingerprint.
+_HW_PROP_KEYS = frozenset({
+    "ro.board.platform",
+    "ro.board.api_level",
+    "ro.board.api_frozen",
+    "ro.soc.manufacturer",
+    "ro.soc.model",
+    "ro.product.board",
+    "ro.hardware.egl",
+    "ro.hardware.vulkan",
+    "ro.hardware.keystore",
+    "ro.hardware.gatekeeper",
+    "ro.hardware.keystore_desede",
+    "ro.hardware.gralloc",
+    "ro.arch",
+})
+
 # The chained partitions whose own vbmeta struct we must fetch to reproduce the
 # top-level vbmeta digest (boot/init_boot carry theirs in an AVB footer, the
 # vbmeta_* partitions are standalone). Discovered from the main vbmeta's chain
@@ -183,6 +203,80 @@ def _embedded_public_key(header, blob):
     return aux[header.public_key_offset:header.public_key_offset + header.public_key_size]
 
 
+def _read_build_prop(img_path):
+    """Read /build.prop out of a filesystem partition image and return its text.
+
+    Handles both filesystems Google ships partitions as: ext4 (magic 0xEF53 at
+    byte 1080) via ``debugfs``, and erofs (magic 0xE0F5E1E2 at byte 1024) via
+    ``fsck.erofs``. Returns None if the tool is unavailable or the file is not
+    found — the caller treats hardware props as best-effort.
+    """
+    import subprocess
+    import tempfile
+    with open(img_path, "rb") as f:
+        f.seek(1080)
+        is_ext4 = f.read(2) == b"\x53\xef"
+    try:
+        if is_ext4:
+            r = subprocess.run(["debugfs", "-R", "cat build.prop", img_path],
+                               capture_output=True, timeout=120)
+            return r.stdout.decode("utf-8", "ignore") if r.returncode == 0 else None
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["fsck.erofs", f"--extract={d}", "--path=/build.prop",
+                            img_path], capture_output=True, timeout=120)
+            out = os.path.join(d, "build.prop")
+            return open(out, errors="ignore").read() if os.path.exists(out) else None
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+
+
+def extract_vendor_hardware_props(factory_url, cookie, work_dir):
+    """Pull the SoC/hardware props from the factory image's vendor/build.prop.
+
+    Returns a {name: value} dict of the props in _HW_PROP_KEYS plus a derived
+    plain ``ro.hardware`` (a runtime bootloader value absent from build.prop; on
+    a Google Tensor device it equals the SoC platform, e.g. zuma). Best-effort:
+    returns {} if vendor.img or the extraction tool is unavailable.
+    """
+    files = _fetch_image_members(factory_url, cookie, ["vendor.img"], work_dir)
+    if "vendor.img" not in files:
+        return {}
+    text = _read_build_prop(files["vendor.img"])
+    if not text:
+        return {}
+    props = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in _HW_PROP_KEYS:
+            props[key] = value
+    # ro.hardware is set by init from the bootloader (ro.boot.hardware), not
+    # build.prop. For a Google/Tensor device it is the SoC platform codename.
+    if props.get("ro.soc.manufacturer") == "Google" and props.get("ro.board.platform"):
+        props["ro.hardware"] = props["ro.board.platform"]
+    return props
+
+
+def extract_baseband(factory_url, cookie, work_dir):
+    """Pull the modem baseband version from the factory image's android-info.txt.
+
+    The bootloader's ``require version-baseband=`` line is exactly the string a
+    real device reports as ``gsm.version.baseband``, so publishing it keeps
+    the probe from seeing a Qualcomm/WAIPIO modem on a device claiming to be a
+    Tensor Pixel. Best-effort: returns {} if android-info.txt is unavailable.
+    """
+    files = _fetch_image_members(factory_url, cookie, ["android-info.txt"], work_dir)
+    if "android-info.txt" not in files:
+        return {}
+    for line in open(files["android-info.txt"], errors="ignore"):
+        line = line.strip()
+        if line.startswith("require version-baseband="):
+            return {"gsm.version.baseband": line.split("=", 1)[1]}
+    return {}
+
+
 def extract_vbmeta_values(factory_url, cookie, work_dir, hash_algorithm="sha256"):
     """Compute the real verified-boot props for a factory image.
 
@@ -261,6 +355,23 @@ def extract_vbmeta_values(factory_url, cookie, work_dir, hash_algorithm="sha256"
             sysprops[base + ".hash_alg"] = desc.hash_algorithm
             sysprops[base + ".root_digest"] = desc.root_digest.hex()
             sysprops[base + ".check_at_most_once"] = _CHECK_AT_MOST_ONCE
+
+    # --- SoC / hardware props from vendor/build.prop (best-effort) ---
+    # Keeps the probe from seeing a Qualcomm/Adreno/QSEE device that claims to
+    # be a Tensor Pixel. A failure here (no vendor.img, no debugfs) only omits
+    # these props; the vbmeta values above are unaffected.
+    try:
+        sysprops.update(extract_vendor_hardware_props(factory_url, cookie, work_dir))
+    except Exception as e:
+        print(f"  WARN: could not read vendor hardware props ({e})", file=sys.stderr)
+
+    # --- modem baseband from android-info.txt (best-effort) ---
+    # Same rationale as the SoC props: a WAIPIO/Qualcomm gsm.version.baseband on
+    # a device claiming to be a Tensor Pixel is an incoherence the probe reads.
+    try:
+        sysprops.update(extract_baseband(factory_url, cookie, work_dir))
+    except Exception as e:
+        print(f"  WARN: could not read baseband ({e})", file=sys.stderr)
 
     return {"sysprops": sysprops, "verified_boot_key": verified_boot_key}
 
