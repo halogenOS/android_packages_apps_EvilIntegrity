@@ -19,9 +19,12 @@ values are then computed with avbtool used as a library.
 Everything here runs offline, at overlay-generation time, on the maintainer's
 machine — never on device.
 """
+import base64
 import os
 import struct
+import subprocess
 import sys
+import tempfile
 import urllib.request
 import zlib
 
@@ -211,8 +214,6 @@ def _read_build_prop(img_path):
     ``fsck.erofs``. Returns None if the tool is unavailable or the file is not
     found — the caller treats hardware props as best-effort.
     """
-    import subprocess
-    import tempfile
     with open(img_path, "rb") as f:
         f.seek(1080)
         is_ext4 = f.read(2) == b"\x53\xef"
@@ -228,6 +229,309 @@ def _read_build_prop(img_path):
             return open(out, errors="ignore").read() if os.path.exists(out) else None
     except (FileNotFoundError, subprocess.SubprocessError):
         return None
+
+
+def _extract_fs_file(img_path, fs_path, out_dir):
+    """Extract a single file (fs_path relative to the filesystem root, no leading
+    slash) from a partition image into out_dir and return its local path.
+
+    Same dual-filesystem handling as _read_build_prop: debugfs for ext4,
+    fsck.erofs for erofs. Raises on failure — callers that want best-effort
+    semantics catch and degrade themselves.
+    """
+    with open(img_path, "rb") as f:
+        f.seek(1080)
+        is_ext4 = f.read(2) == b"\x53\xef"
+    fs_dir, base = os.path.split(fs_path)
+    if is_ext4:
+        # rdump insists on creating <dest>/<basename(src)> itself and fails if
+        # it already exists — always hand it a fresh directory.
+        with tempfile.TemporaryDirectory(dir=out_dir) as td:
+            r = subprocess.run(["debugfs", "-R", f"rdump /{fs_dir} {td}", img_path],
+                               capture_output=True, timeout=600)
+            dumped = os.path.join(td, os.path.basename(fs_dir), base)
+            out = os.path.join(out_dir, base)
+            if r.returncode != 0 or not os.path.exists(dumped):
+                raise RuntimeError(f"debugfs could not extract /{fs_path}: "
+                                   f"{r.stderr.decode('utf-8', 'ignore')[:200]}")
+            os.replace(dumped, out)
+        return out
+    subprocess.run(["fsck.erofs", f"--extract={out_dir}", f"--path=/{fs_path}",
+                    img_path], capture_output=True, timeout=600, check=True)
+    out = os.path.join(out_dir, fs_path)
+    if not os.path.exists(out):
+        raise RuntimeError(f"fsck.erofs did not produce /{fs_path}")
+    return out
+
+
+# --- APK signing-block parsing (v2/v3 schemes) -------------------------------
+# The APK Signing Block sits immediately before the ZIP central directory:
+# [size u64][(len u64, id u32, value)*][size u64]["APK Sig Block 42"].
+# v2 (0x7109871a) and v3 (0xf05368c0) share the same signer layout:
+#   signers      = u32-len-prefixed sequence of signer
+#   signer       = lp(signed_data) lp(signatures) lp(public_key)
+#   signed_data  = lp(digests) lp(certificates) lp(attributes)
+# and the lineage is represented as multiple signers, newest first is NOT
+# guaranteed — order is signing order, so signers[0] is the current signer for
+# apksigner-produced lineage (apksigner writes the current signer first).
+_APK_SIG_BLOCK_MAGIC = b"APK Sig Block 42"
+_APK_SIG_V2_ID = 0x7109871A
+_APK_SIG_V3_ID = 0xF05368C0
+
+
+def _lp(buf, off):
+    """Read a u32-LE length-prefixed blob; return (bytes, next_offset)."""
+    ln = struct.unpack_from("<I", buf, off)[0]
+    return buf[off + 4:off + 4 + ln], off + 4 + ln
+
+
+def _der_tlv(buf, off):
+    """Minimal DER TLV reader -> (tag, content_off, content_len, next_off)."""
+    tag = buf[off]
+    off += 1
+    ln = buf[off]
+    off += 1
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln = int.from_bytes(buf[off:off + n], "big")
+        off += n
+    return tag, off, ln, off + ln
+
+
+def _cert_from_pkcs7(der):
+    """Pull the first X.509 cert out of a PKCS#7 SignedData (META-INF/*.RSA)."""
+    tag, c, _, _ = _der_tlv(der, 0)              # ContentInfo SEQUENCE
+    if tag != 0x30:
+        raise RuntimeError("not a PKCS#7 ContentInfo")
+    off = c
+    _, _, _, off = _der_tlv(der, off)            # contentType OID
+    tag, c, _, _ = _der_tlv(der, off)            # [0] EXPLICIT signedData
+    tag, c, _, _ = _der_tlv(der, c)              # SignedData SEQUENCE
+    off = c
+    _, _, _, off = _der_tlv(der, off)            # version
+    _, _, _, off = _der_tlv(der, off)            # digestAlgorithms
+    _, _, _, off = _der_tlv(der, off)            # contentInfo
+    tag, c, _, _ = _der_tlv(der, off)            # [0] IMPLICIT certificates
+    if tag != 0xA0:
+        raise RuntimeError("no certificates in PKCS#7")
+    tag, cc, _, nxt = _der_tlv(der, c)           # first certificate SEQUENCE
+    if tag != 0x30:
+        raise RuntimeError("malformed certificate")
+    return der[c:nxt]
+
+
+def _apk_signing_certs(apk_path):
+    """Return the ordered list of X.509 DER certs from an APK's v3 (preferred)
+    or v2 signing block — one entry per signer (lineage), first = current.
+    Falls back to the v1/JAR signature (META-INF/*.RSA) — Google's
+    framework-res.apk ships v1-only."""
+    with open(apk_path, "rb") as f:
+        data = f.read()
+    i = data.rfind(b"PK\x05\x06")
+    if i < 0:
+        raise RuntimeError("not a zip")
+    cd_off = struct.unpack_from("<I", data, i + 16)[0]
+    if data[cd_off - 16:cd_off] == _APK_SIG_BLOCK_MAGIC:
+        block_size = struct.unpack_from("<Q", data, cd_off - 24)[0]
+        off, end = cd_off - 24 - block_size + 8, cd_off - 24
+        pairs = {}
+        while off < end:
+            plen = struct.unpack_from("<Q", data, off)[0]
+            if plen < 4 or off + 8 + plen > end:
+                break
+            pid = struct.unpack_from("<I", data, off + 8)[0]
+            pairs[pid] = data[off + 12:off + 8 + plen]
+            off += 8 + plen
+        blob = pairs.get(_APK_SIG_V3_ID) or pairs.get(_APK_SIG_V2_ID)
+        if blob is not None:
+            signers, _ = _lp(blob, 0)
+            certs = []
+            s_off = 0
+            while s_off < len(signers):
+                signer, s_off = _lp(signers, s_off)
+                signed_data, _ = _lp(signer, 0)
+                _, c_off = _lp(signed_data, 0)          # digests
+                cert_seq, _ = _lp(signed_data, c_off)   # certificates
+                cert, _ = _lp(cert_seq, 0)              # first = signing cert
+                certs.append(cert)
+            if certs:
+                return certs
+    # v1 fallback: PKCS#7 in META-INF
+    import zipfile
+    with zipfile.ZipFile(apk_path) as z:
+        rsa = next((n for n in z.namelist()
+                    if n.startswith("META-INF/") and n.upper().endswith(".RSA")), None)
+        if rsa is None:
+            raise RuntimeError("no v2/v3 signing scheme and no META-INF/*.RSA")
+        return [_cert_from_pkcs7(z.read(rsa))]
+
+
+def _java_cert_hashcode(der):
+    """The java.util.Arrays.hashCode(byte[]) of the cert DER — the exact value
+    PackageManager reports as the legacy PackageInfo.signatures[] int."""
+    h = 1
+    for b in der:
+        sb = b - 256 if b > 127 else b
+        h = (31 * h + sb) & 0xFFFFFFFF
+    return h
+
+
+def _varint(buf, off):
+    v = 0
+    shift = 0
+    while True:
+        x = buf[off]
+        off += 1
+        v |= (x & 0x7F) << shift
+        if not (x & 0x80):
+            break
+        shift += 7
+    return v, off
+
+
+def _apex_manifest_name_version(manifest):
+    """Parse apex_manifest.pb for (moduleName, versionCode) with a minimal
+    proto walker — fields 1 (name, len-delimited) and 2 (version, varint)."""
+    import zipfile  # noqa: F401 (kept import-local style of this module)
+    off = 0
+    name = None
+    ver = None
+    while off < len(manifest):
+        tag, off = _varint(manifest, off)
+        field, wt = tag >> 3, tag & 7
+        if wt == 2:
+            ln, off = _varint(manifest, off)
+            val = manifest[off:off + ln]
+            off += ln
+            if field == 1:
+                name = val.decode()
+        elif wt == 0:
+            val, off = _varint(manifest, off)
+            if field == 2:
+                ver = val
+        elif wt == 1:
+            off += 8
+        elif wt == 5:
+            off += 4
+        else:
+            break
+    return name, ver
+
+
+def _der_len(n):
+    if n < 128:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _der_octet(data):
+    return b"\x04" + _der_len(len(data)) + data
+
+
+def _der_int(v):
+    b = v.to_bytes((v.bit_length() + 8) // 8, "big") if v else b"\x00"
+    b = b.lstrip(b"\x00") or b"\x00"
+    if b[0] & 0x80:
+        b = b"\x00" + b
+    return b"\x02" + _der_len(len(b)) + b
+
+
+def _der_seq(content):
+    return b"\x30" + _der_len(len(content)) + content
+
+
+def _der_set(content):
+    return b"\x31" + _der_len(len(content)) + content
+
+
+def compute_module_hash(apex_dir):
+    """Compute the KeyMint moduleHash over a directory of .apex packages.
+
+    moduleHash = SHA-256 over the DER encoding of
+      Modules ::= SET OF { SEQUENCE { packageName OCTET_STRING, version INTEGER } }
+    with entries sorted by OctetString DerOrd (name length, then name bytes) —
+    mirroring keystore2's Maintenance::encode_module_info. Returns hex string.
+    """
+    import hashlib
+    import zipfile
+    mods = []
+    for fn in sorted(os.listdir(apex_dir)):
+        if not fn.endswith(".apex"):
+            continue
+        try:
+            with zipfile.ZipFile(os.path.join(apex_dir, fn)) as z:
+                name, ver = _apex_manifest_name_version(z.read("apex_manifest.pb"))
+            if name and ver is not None:
+                mods.append((name, ver))
+        except Exception:
+            continue
+    mods.sort(key=lambda m: (len(m[0].encode()), m[0].encode()))
+    blob = _der_set(b"".join(_der_seq(_der_octet(n.encode()) + _der_int(v))
+                             for n, v in mods))
+    return hashlib.sha256(blob).hexdigest()
+
+
+def extract_module_hash(factory_url, cookie, work_dir):
+    """Pull the factory image's system partition and compute the KeyMint
+    moduleHash of the claimed device from its APEX packages."""
+    os.makedirs(work_dir, exist_ok=True)
+    files = _fetch_image_members(factory_url, cookie, ["system.img"], work_dir)
+    if "system.img" not in files:
+        raise RuntimeError("factory image has no system.img")
+    img = files["system.img"]
+    with open(img, "rb") as f:
+        f.seek(1080)
+        is_ext4 = f.read(2) == b"\x53\xef"
+    if not is_ext4:
+        raise RuntimeError("module hash: erofs not supported yet")
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=work_dir) as td:
+        subprocess.run(["debugfs", "-R", f"rdump /system/apex {td}", img],
+                       capture_output=True, timeout=600, check=True)
+        return compute_module_hash(os.path.join(td, "apex"))
+
+
+def extract_platform_cert(factory_url, cookie, work_dir,
+                          carrier=("system.img", "framework/framework-res.apk")):
+    """Pull the stock platform signing certificate out of the factory image.
+
+    The integrity probe hashes the signing certificate of the ``android``
+    package (and other platform-signed packages). On stock that is Google's
+    platform cert; on a custom ROM it is the ROM's own cert — a direct tell.
+    This extracts the stock cert from the factory image so the conformance
+    attributes can carry it. ``carrier`` is (partition member, path of a
+    platform-signed APK in that partition's filesystem); framework-res.apk is
+    the ``android`` package itself.
+
+    Returns {"pem": str, "der_b64": str, "java_hashcode": "0x........",
+             "sha256": hex, "lineage": [der_b64, ...]} — raises on failure.
+    """
+    import hashlib
+    os.makedirs(work_dir, exist_ok=True)
+    files = _fetch_image_members(factory_url, cookie, [carrier[0]], work_dir)
+    if carrier[0] not in files:
+        raise RuntimeError(f"factory image has no {carrier[0]}")
+    try:
+        apk = _extract_fs_file(files[carrier[0]], carrier[1], work_dir)
+    except RuntimeError:
+        # system-as-root images (modern Pixels) carry /system as a subdirectory
+        # of the partition root rather than mounting at the root.
+        apk = _extract_fs_file(files[carrier[0]], "system/" + carrier[1], work_dir)
+    certs = _apk_signing_certs(apk)
+    if not certs:
+        raise RuntimeError(f"no signing certs in {carrier[1]}")
+    der = certs[0]
+    pem = ("-----BEGIN CERTIFICATE-----\n"
+           + "\n".join(base64.encodebytes(der).decode().splitlines())
+           + "\n-----END CERTIFICATE-----\n")
+    return {
+        "pem": pem,
+        "der_b64": base64.b64encode(der).decode(),
+        "java_hashcode": "0x%08x" % _java_cert_hashcode(der),
+        "sha256": hashlib.sha256(der).hexdigest(),
+        "lineage": [base64.b64encode(c).decode() for c in certs[1:]],
+    }
 
 
 def extract_vendor_hardware_props(factory_url, cookie, work_dir):
@@ -379,7 +683,19 @@ def extract_vbmeta_values(factory_url, cookie, work_dir, hash_algorithm="sha256"
 if __name__ == "__main__":
     # Self-test against the known akita CP1A.260505.005 factory image.
     url = "https://dl.google.com/dl/android/aosp/akita-cp1a.260505.005-factory-4790ccab.zip"
-    out = extract_vbmeta_values(url, "devsite_wall_acks=nexus-image-tos",
-                                os.path.expanduser("~/.cache/vbmeta_extract_selftest"))
-    import json
-    print(json.dumps(out, indent=2))
+    if len(sys.argv) > 1 and sys.argv[1] == "cert":
+        out = extract_platform_cert(url, "devsite_wall_acks=nexus-image-tos",
+                                    os.path.expanduser("~/.cache/vbmeta_extract_selftest"))
+        import json
+        printable = {k: (v if k != "pem" else v[:60] + "...") for k, v in out.items()}
+        print(json.dumps(printable, indent=2))
+        dest = os.path.join(os.path.expanduser("~/.cache/vbmeta_extract_selftest"),
+                            "stock_platform_cert.pem")
+        with open(dest, "w") as f:
+            f.write(out["pem"])
+        print(f"PEM written to {dest}")
+    else:
+        out = extract_vbmeta_values(url, "devsite_wall_acks=nexus-image-tos",
+                                    os.path.expanduser("~/.cache/vbmeta_extract_selftest"))
+        import json
+        print(json.dumps(out, indent=2))

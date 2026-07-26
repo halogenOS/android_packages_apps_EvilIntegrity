@@ -281,14 +281,40 @@ class FingerprintFetcher:
             try:
                 values = vbmeta_extract.extract_vbmeta_values(
                     factory_url, self.STABLE_IMAGES_COOKIE, work_dir)
+                result['_RAW_SYSPROPS'] = values['sysprops']
+                result['_ATTEST'] = {'VBOOT_KEY': values['verified_boot_key']}
+                print(f"  vbmeta.digest={values['sysprops']['ro.boot.vbmeta.digest']} "
+                      f"({len(values['sysprops'])} raw props, "
+                      f"verifiedBootKey={values['verified_boot_key'][:16]}...)")
+                # The stock platform signing cert: the probe hashes the
+                # `android` package's signer, so the conformance attributes
+                # carry the stock cert for the report-time signing-info
+                # spoof. Best-effort, independent of the vbmeta values.
+                try:
+                    cert = vbmeta_extract.extract_platform_cert(
+                        factory_url, self.STABLE_IMAGES_COOKIE, work_dir)
+                    result['_ATTEST']['PLATFORM_CERT'] = cert['der_b64']
+                    if cert['lineage']:
+                        result['_ATTEST']['PLATFORM_CERT_LINEAGE'] = \
+                            ','.join(cert['lineage'])
+                    print(f"  platform cert sha256={cert['sha256'][:16]}... "
+                          f"(java_hashcode={cert['java_hashcode']})")
+                except Exception as e:
+                    print(f"  WARN: could not extract platform cert ({e}); "
+                          "overlay will omit it")
+                # KeyMint moduleHash of the claimed device: SHA-256 over the
+                # DER-encoded APEX Modules set (KeyMint 4.0 attestations carry
+                # it in softwareEnforced). Best-effort, independent.
+                try:
+                    mh = vbmeta_extract.extract_module_hash(
+                        factory_url, self.STABLE_IMAGES_COOKIE, work_dir)
+                    result['_ATTEST']['MODULE_HASH'] = mh
+                    print(f"  moduleHash={mh[:16]}...")
+                except Exception as e:
+                    print(f"  WARN: could not compute module hash ({e}); "
+                          "overlay will omit it")
             finally:
                 shutil.rmtree(work_dir, ignore_errors=True)
-
-            result['_RAW_SYSPROPS'] = values['sysprops']
-            result['_ATTEST'] = {'VBOOT_KEY': values['verified_boot_key']}
-            print(f"  vbmeta.digest={values['sysprops']['ro.boot.vbmeta.digest']} "
-                  f"({len(values['sysprops'])} raw props, "
-                  f"verifiedBootKey={values['verified_boot_key'][:16]}...)")
         except Exception as e:
             print(f"  WARN: could not read vbmeta values ({e}); "
                   "overlay will omit them")
