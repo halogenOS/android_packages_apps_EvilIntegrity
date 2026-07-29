@@ -84,8 +84,10 @@ public class CorporateControlSatisfierService extends ContentProvider {
             return null;
         }
 
-        final String[] attrs = getContext().getResources()
-                .getStringArray(R.array.control_conformance_attributes);
+        final String[] attrs = getContext().getResources().getStringArray(
+                "native".equals(arg)
+                        ? R.array.control_conformance_attributes_native
+                        : R.array.control_conformance_attributes);
         final Bundle result = new Bundle();
         result.putStringArray(KEY_ATTRIBUTES, attrs);
         return result;
