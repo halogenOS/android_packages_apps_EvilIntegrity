@@ -22,6 +22,10 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
+import android.provider.Settings;
+import android.text.TextUtils;
+
+import org.json.JSONArray;
 
 /**
  * Caller-gated provider that hands out the control-conformance attributes to
@@ -87,7 +91,7 @@ public class CorporateControlSatisfierService extends ContentProvider {
         return result;
     }
 
-    private static boolean isAllowed(String[] pkgs) {
+    private boolean isAllowed(String[] pkgs) {
         if (pkgs == null) {
             return false;
         }
@@ -95,6 +99,33 @@ public class CorporateControlSatisfierService extends ContentProvider {
             if (PACKAGE_GMS.equals(pkg) || PACKAGE_VENDING.equals(pkg)) {
                 return true;
             }
+            if (isUserOptedPackage(pkg)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the user opted this package into the spoof layer through the
+     * Settings UI (Settings.Secure.ATTESTATION_SPOOF_PACKAGES, JSON array).
+     * The framework applies the same list when deciding which processes get
+     * the spoofed properties, so the two checks stay consistent.
+     */
+    private boolean isUserOptedPackage(String pkg) {
+        try {
+            String json = Settings.Secure.getString(getContext().getContentResolver(),
+                    "attestation_spoof_packages");
+            if (TextUtils.isEmpty(json)) {
+                return false;
+            }
+            JSONArray arr = new JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) {
+                if (pkg.equals(arr.optString(i))) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
         }
         return false;
     }
