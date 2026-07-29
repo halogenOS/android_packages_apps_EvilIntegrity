@@ -680,6 +680,24 @@ class OverlayGenerator:
                     item = ET.SubElement(array, 'item')
                     item.text = f"{prop_key}:{value}"
 
+        # Identity-consistency props that don't come from the fingerprint but
+        # must agree with the claimed device when a probe sweeps the full
+        # property set: ro.build.product mirrors the device codename, the GMS
+        # client id base is the stock Google value, and the Bluetooth name is
+        # the marketing model.
+        consistency_sysprops = []
+        if self.fingerprint_data.get('DEVICE'):
+            consistency_sysprops.append(
+                ('ro.build.product', self.fingerprint_data['DEVICE']))
+        consistency_sysprops.append(
+            ('ro.com.google.clientidbase', 'android-google'))
+        if self.fingerprint_data.get('MODEL'):
+            consistency_sysprops.append(
+                ('bluetooth.device.default_name', self.fingerprint_data['MODEL']))
+        for name, value in consistency_sysprops:
+            item = ET.SubElement(array, 'item')
+            item.text = f"SYSPROP.{name}:{value}"
+
         # Raw system properties (real verified-boot values from the factory
         # image). These are applied verbatim by SimplePropImitation via the
         # SYSPROP. prefix, not mapped onto Build.* fields.
