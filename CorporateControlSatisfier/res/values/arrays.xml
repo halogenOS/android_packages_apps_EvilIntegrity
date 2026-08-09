@@ -19,4 +19,9 @@
     </string-array>
     <string-array name="control_conformance_attributes_native" translatable="false">
     </string-array>
+    <!-- Device-specific conformance attributes, overlaid per device (e.g.
+         SYSPROP_HIDE entries for host-device props the claimed device does
+         not have). Merged into the default attribute set by the provider. -->
+    <string-array name="control_conformance_attributes_device" translatable="false">
+    </string-array>
 </resources>

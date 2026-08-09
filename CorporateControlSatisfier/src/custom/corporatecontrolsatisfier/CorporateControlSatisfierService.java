@@ -27,6 +27,8 @@ import android.text.TextUtils;
 
 import org.json.JSONArray;
 
+import java.util.Arrays;
+
 /**
  * Caller-gated provider that hands out the control-conformance attributes to
  * the processes that legitimately need them, and only those. The attributes
@@ -84,10 +86,22 @@ public class CorporateControlSatisfierService extends ContentProvider {
             return null;
         }
 
-        final String[] attrs = getContext().getResources().getStringArray(
-                "native".equals(arg)
-                        ? R.array.control_conformance_attributes_native
-                        : R.array.control_conformance_attributes);
+        final String[] attrs;
+        if ("native".equals(arg)) {
+            attrs = getContext().getResources().getStringArray(
+                    R.array.control_conformance_attributes_native);
+        } else {
+            // The default (certified) set is the system-side attributes plus
+            // the device-specific ones (control_conformance_attributes_device,
+            // overlaid per device — e.g. SYSPROP_HIDE entries for host props
+            // the claimed device does not have).
+            final String[] base = getContext().getResources().getStringArray(
+                    R.array.control_conformance_attributes);
+            final String[] device = getContext().getResources().getStringArray(
+                    R.array.control_conformance_attributes_device);
+            attrs = Arrays.copyOf(base, base.length + device.length);
+            System.arraycopy(device, 0, attrs, base.length, device.length);
+        }
         final Bundle result = new Bundle();
         result.putStringArray(KEY_ATTRIBUTES, attrs);
         return result;
