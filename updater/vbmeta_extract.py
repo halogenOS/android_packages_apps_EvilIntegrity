@@ -21,6 +21,7 @@ machine — never on device.
 """
 import base64
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -560,6 +561,59 @@ def extract_vendor_hardware_props(factory_url, cookie, work_dir):
     # build.prop. For a Google/Tensor device it is the SoC platform codename.
     if props.get("ro.soc.manufacturer") == "Google" and props.get("ro.board.platform"):
         props["ro.hardware"] = props["ro.board.platform"]
+    return props
+
+
+# Partition images carrying a build.prop, and the prop's path inside the
+# filesystem. A probe sweeping the property set reads every ro.<part>.* /
+# ro.product.<part>.* family; on the claimed device all of them agree with
+# the main identity, so any partition left at the real device's values is a
+# standalone contradiction.
+_PARTITION_BUILD_PROPS = {
+    "system.img": "build.prop",
+    "vendor.img": "build.prop",
+    "odm.img": "etc/build.prop",
+    "product.img": "etc/build.prop",
+    "system_ext.img": "etc/build.prop",
+    "vendor_dlkm.img": "etc/build.prop",
+    "odm_dlkm.img": "etc/build.prop",
+}
+
+# Identity prop families taken from each partition's build.prop.
+_IDENTITY_PROP_RE = re.compile(
+    r"^ro\.(build|product|odm|vendor|system|system_ext|bootimage|"
+    r"vendor_dlkm|odm_dlkm)\.")
+
+
+def extract_partition_props(factory_url, cookie, work_dir):
+    """Pull identity props from every partition build.prop in the factory
+    image (ro.build.*, ro.product.<part>.*, ro.<part>.* — incl. the odm
+    family). Best-effort per partition: missing images/files are skipped.
+    Later partitions never override a key an earlier one already supplied.
+    """
+    files = _fetch_image_members(factory_url, cookie,
+                                 list(_PARTITION_BUILD_PROPS), work_dir)
+    props = {}
+    for member, fs_path in _PARTITION_BUILD_PROPS.items():
+        if member not in files:
+            continue
+        with tempfile.TemporaryDirectory(dir=work_dir) as d:
+            try:
+                out = _extract_fs_file(files[member], fs_path, d)
+            except Exception:
+                continue
+            try:
+                with open(out, errors="ignore") as f:
+                    text = f.read()
+            except OSError:
+                continue
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if _IDENTITY_PROP_RE.match(key) and key not in props:
+                props[key] = value
     return props
 
 

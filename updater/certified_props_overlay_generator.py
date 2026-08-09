@@ -313,6 +313,30 @@ class FingerprintFetcher:
                 except Exception as e:
                     print(f"  WARN: could not compute module hash ({e}); "
                           "overlay will omit it")
+                # Partition identity props (ro.odm.*, ro.product.<part>.*,
+                # ro.<part>.build.fingerprint, ...): a probe sweeping the full
+                # property set reads these alongside the main identity; at the
+                # real device's values they contradict the claimed model.
+                # Best-effort, independent.
+                try:
+                    part = vbmeta_extract.extract_partition_props(
+                        factory_url, self.STABLE_IMAGES_COOKIE, work_dir)
+                    for k, v in part.items():
+                        result['_RAW_SYSPROPS'].setdefault(k, v)
+                    print(f"  partition identity props: {len(part)}")
+                    # Runtime-defaulted partition fingerprints: partitions
+                    # whose build.prop omits ro.<part>.build.fingerprint get
+                    # the main fingerprint from init's defaulting on stock —
+                    # replicate that explicitly (extraction can't see it).
+                    fp = result.get('FINGERPRINT')
+                    if fp:
+                        for name in ('ro.odm.build.fingerprint',
+                                     'ro.system.build.fingerprint',
+                                     'ro.bootimage.build.fingerprint'):
+                            result['_RAW_SYSPROPS'].setdefault(name, fp)
+                except Exception as e:
+                    print(f"  WARN: could not extract partition props ({e}); "
+                          "overlay will omit them")
             finally:
                 shutil.rmtree(work_dir, ignore_errors=True)
         except Exception as e:
@@ -694,6 +718,9 @@ class OverlayGenerator:
         if self.fingerprint_data.get('MODEL'):
             consistency_sysprops.append(
                 ('bluetooth.device.default_name', self.fingerprint_data['MODEL']))
+            # USB gadget product string carries the marketing model on stock
+            consistency_sysprops.append(
+                ('vendor.usb.product_string', self.fingerprint_data['MODEL']))
         for name, value in consistency_sysprops:
             item = ET.SubElement(array, 'item')
             item.text = f"SYSPROP.{name}:{value}"
